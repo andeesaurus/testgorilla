@@ -38,7 +38,7 @@
   };
   const DEFAULTS = {
     format: "mock", lineup: "standard", single: "NR", practiceCat: "all", practiceSub: "all",
-    qcount: "random", calc: "physical", extra: 0,
+    qcount: "random", calc: "physical", extra: 0, progression: "progressive",
     custom: ["CT", "WD", "NR", "PS", "BJ", "LP"].map((cat, i) => ({ cat, on: i < 4, min: 10, n: "random" })),
   };
   let settings = Object.assign({}, DEFAULTS, store.get("settings", {}));
@@ -58,15 +58,30 @@
   const timedRunning = () => isTimed() && A.phase === "question";
   const mockInProgress = () => isTimed() && A.phase !== "results";
 
+  /* ---------------- difficulty ---------------- */
+  // Share of L1-L4 questions in each test. Progressive mode moves up one level per finished mock.
+  const LEVELS = [
+    { name: "Level 1 · Standard mix", mix: [0.25, 0.5, 0.25, 0] },
+    { name: "Level 2 · Harder", mix: [0.17, 0.42, 0.29, 0.12] },
+    { name: "Level 3 · Hard", mix: [0.08, 0.34, 0.33, 0.25] },
+    { name: "Level 4 · Hardest", mix: [0, 0.25, 0.42, 0.33] },
+  ];
+  const mocksDone = () => store.get("history", []).filter((h) => String(h.label).startsWith("Full mock")).length;
+  function currentLevel() {
+    if (settings.progression !== "progressive") return Math.max(0, Math.min(3, Number(settings.progression) || 0));
+    return Math.min(3, mocksDone());
+  }
+
   /* ---------------- question selection ---------------- */
-  function tierSplit(n) {
-    const l1 = Math.round(n * 0.25), l3 = Math.round(n * 0.25);
-    return [l1, n - l1 - l3, l3];
+  function tierSplit(n, level) {
+    const counts = LEVELS[level].mix.map((m) => Math.round(m * n));
+    counts[1] += n - counts.reduce((a, b) => a + b, 0);
+    return counts;
   }
 
   function parseNum(t) {
     const m = String(t).replace(/−/g, "-").replace(/,/g, "")
-      .match(/^([+-])?[£$€]?([+-])?(\d*\.?\d+)\s*(%|pp|percentage points|units|years|m|k|bn)?$/i);
+      .match(/^([+-])?[£$€]?([+-])?(\d*\.?\d+)\s*(%|pp|percentage points|units|years|days|hours|m|k|bn)?$/i);
     if (!m) return null;
     const sign = m[1] === "-" || m[2] === "-" ? -1 : 1;
     return sign * parseFloat(m[3]);
@@ -80,75 +95,64 @@
     return shuffle(idx);
   }
 
-  function pickDiverse(cands, need, chosen, seen) {
+  // Picks `need` items, spreading sub-skills. Items solved correctly before are used only when
+  // nothing else is left; items merely seen come next; harder items win ties when filling gaps.
+  function pickDiverse(cands, need, chosen, seen, solved, preferHard) {
     const out = [];
     const subCount = {};
-    chosen.concat(out).forEach((q) => (subCount[q.sub] = (subCount[q.sub] || 0) + 1));
+    chosen.forEach((q) => (subCount[q.sub] = (subCount[q.sub] || 0) + 1));
     let pool = cands.slice();
     while (out.length < need && pool.length) {
       let best = 0, bestScore = Infinity;
       pool.forEach((q, i) => {
-        const score = (seen.has(q.id) ? 100 : 0) + (subCount[q.sub] || 0) * 3 + Math.random();
+        const score = (solved.has(q.id) ? 1000 : 0) + (seen.has(q.id) ? 100 : 0) + (subCount[q.sub] || 0) * 3 +
+          (preferHard ? (4 - q.tier) * 2 : 0) + Math.random();
         if (score < bestScore) { bestScore = score; best = i; }
       });
       const q = pool.splice(best, 1)[0];
       out.push(q);
       subCount[q.sub] = (subCount[q.sub] || 0) + 1;
-      // a generated item and its twin share an id prefix; drop exact duplicates
       pool = pool.filter((x) => x.id !== q.id);
     }
     return out;
   }
 
-  function draw(cat, n, used) {
+  function draw(cat, n, used, level) {
     const seen = new Set(store.get("seen", []));
+    const solved = new Set(store.get("solved", []));
     const gens = [];
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 14; i++) {
       const g = D.generate(cat);
       if (g && !used.has(g.id) && !gens.some((x) => x.id === g.id)) gens.push(g);
     }
     const all = D.BANK.filter((q) => q.cat === cat && !used.has(q.id)).concat(gens);
     const chosen = [];
-    tierSplit(n).forEach((need, t) => {
+    tierSplit(n, level).forEach((need, t) => {
       const cands = shuffle(all.filter((q) => q.tier === t + 1));
-      chosen.push(...pickDiverse(cands, need, chosen, seen));
+      chosen.push(...pickDiverse(cands, need, chosen, seen, solved, false));
     });
-    if (chosen.length < n) {
+    if (chosen.length < n) { // a tier ran short: fill with the hardest items left
       const rest = shuffle(all.filter((q) => !chosen.includes(q)));
-      chosen.push(...pickDiverse(rest, n - chosen.length, chosen, seen));
+      chosen.push(...pickDiverse(rest, n - chosen.length, chosen, seen, solved, true));
     }
     while (chosen.length < n) { // tiny pool: allow repeats rather than a short test
-      const extra = shuffle(D.BANK.filter((q) => q.cat === cat))[0];
-      chosen.push(extra);
+      chosen.push(shuffle(D.BANK.filter((q) => q.cat === cat))[0]);
     }
     chosen.forEach((q) => used.add(q.id));
     return arrange(chosen);
   }
 
-  // Spread stretch (L3) items through the test; warm-ups lean early.
+  // Questions get harder as the test goes on: warm-ups first, challenge items last.
   function arrange(qs) {
-    const hard = shuffle(qs.filter((q) => q.tier === 3));
-    const rest = qs.filter((q) => q.tier !== 3)
-      .map((q) => ({ q, k: q.tier + Math.random() * 1.6 }))
-      .sort((a, b) => a.k - b.k).map((x) => x.q);
-    const n = qs.length;
-    const slots = new Set(hard.map((_, i) => Math.min(n - 1, Math.floor(((i + 1) * n) / (hard.length + 1)))));
-    const out = [];
-    let h = 0, r = 0;
-    for (let i = 0; i < n; i++) {
-      if (slots.has(i) && h < hard.length) out.push(hard[h++]);
-      else if (r < rest.length) out.push(rest[r++]);
-      else out.push(hard[h++]);
-    }
-    return out;
+    return qs.map((q) => ({ q, k: q.tier + Math.random() * 0.9 })).sort((a, b) => a.k - b.k).map((x) => x.q);
   }
 
   /* ---------------- starting sessions ---------------- */
   const qCount = (v) => (v === "random" ? ri(12, 15) : Number(v));
   const extraFactor = () => 1 + Number(settings.extra || 0) / 100;
 
-  function makeTest(cat, minutes, n, used) {
-    const qs = draw(cat, n, used);
+  function makeTest(cat, minutes, n, used, level) {
+    const qs = draw(cat, n, used, level);
     return {
       cat, name: CATS[cat].name, sec: Math.round(minutes * 60 * extraFactor()),
       qs, ord: qs.map(optionOrder), ans: qs.map(() => ({ sel: null, t: 0, st: "unseen" })),
@@ -159,22 +163,23 @@
 
   function startTimed() {
     const used = new Set();
+    const level = currentLevel();
     let tests, label;
     if (settings.format === "single") {
-      tests = [makeTest(settings.single, 10, qCount(settings.qcount), used)];
+      tests = [makeTest(settings.single, 10, qCount(settings.qcount), used, level)];
       label = `Single test · ${CATS[settings.single].name}`;
     } else if (settings.lineup === "custom") {
       const rows = settings.custom.filter((r) => r.on);
       if (!rows.length) { toast("Choose at least one test for the custom lineup."); return; }
-      tests = rows.map((r) => makeTest(r.cat, Number(r.min), qCount(r.n), used));
+      tests = rows.map((r) => makeTest(r.cat, Number(r.min), qCount(r.n), used, level));
       label = "Full mock · Custom";
     } else {
-      tests = LINEUPS[settings.lineup].cats.map((c) => makeTest(c, 10, qCount(settings.qcount), used));
+      tests = LINEUPS[settings.lineup].cats.map((c) => makeTest(c, 10, qCount(settings.qcount), used, level));
       label = `Full mock · ${LINEUPS[settings.lineup].label}`;
     }
     A = {
       kind: settings.format === "single" ? "single" : "mock", label, created: now(),
-      calc: settings.calc, extra: Number(settings.extra || 0),
+      calc: settings.calc, extra: Number(settings.extra || 0), level,
       tests, ti: 0, phase: "intro", cur: null, qStart: null, hidden: 0,
       notice: null, saved: false, pauseUntil: null, exChecked: false, exSel: null,
     };
@@ -335,7 +340,7 @@
     const s = summarize(A);
     const hist = store.get("history", []);
     hist.push({
-      date: A.created, label: A.label, calc: A.calc, extra: A.extra, hidden: A.hidden,
+      date: A.created, label: A.label, calc: A.calc, extra: A.extra, hidden: A.hidden, level: A.level,
       pct: s.pct, correct: s.correct, total: s.total, avgSec: s.avgSec,
       tests: s.tests.map((t) => ({ name: t.name, correct: t.correct, total: t.total, timeUsed: t.timeUsed, avg: t.avg })),
     });
@@ -343,8 +348,16 @@
     const seen = store.get("seen", []);
     A.tests.forEach((t) => t.qs.forEach((q) => seen.push(q.id)));
     store.set("seen", seen.slice(-600));
+    A.tests.forEach((t) => t.qs.forEach((q, i) => { if (isRight(q, t.ans[i].sel)) markSolved(q.id); }));
   }
 
+  // Questions answered correctly are held back from later draws while fresh ones remain.
+  function markSolved(id) {
+    const solved = store.get("solved", []);
+    if (!solved.includes(id)) { solved.push(id); store.set("solved", solved.slice(-1000)); }
+  }
+
+  const TIER_NAMES = { 1: "L1 warm-up", 2: "L2 core", 3: "L3 stretch", 4: "L4 challenge" };
   const paceFlag = (sec) => (sec < 30 ? "fast" : sec <= 60 ? "on pace" : "slow");
 
   /* ---------------- exhibits ---------------- */
@@ -515,6 +528,9 @@
           <div class="field"><label class="field-l" for="calc">Calculator</label>
             <select id="calc"><option value="physical" ${s.calc === "physical" ? "selected" : ""}>Physical calculator allowed</option><option value="none" ${s.calc === "none" ? "selected" : ""}>No calculator (hard mode)</option></select>
             <span class="field-h">There is no on-screen calculator</span></div>
+          <div class="field"><label class="field-l" for="progression">Difficulty</label>
+            <select id="progression"><option value="progressive" ${s.progression === "progressive" ? "selected" : ""}>Progressive (now ${LEVELS[Math.min(3, mocksDone())].name.split(" · ")[0]})</option>${LEVELS.map((l, i) => `<option value="${i}" ${String(s.progression) === String(i) ? "selected" : ""}>${l.name}</option>`).join("")}</select>
+            <span class="field-h">Progressive steps up after each full mock you finish</span></div>
           <div class="field"><label class="field-l" for="extra">Extra time</label>
             <select id="extra">${[0, 25, 50].map((v) => `<option value="${v}" ${Number(s.extra) === v ? "selected" : ""}>${v ? "+" + v + "%" : "None"}</option>`).join("")}</select>
             <span class="field-h">For non-fluent English speakers</span></div>
@@ -592,13 +608,14 @@
             <dl class="facts">
               <div><dt>Time</dt><dd class="num">You have ${mmss(t.sec)} for this test${extra}</dd></div>
               <div><dt>Questions</dt><dd class="num">${t.qs.length}, multiple choice, one answer each</dd></div>
+              <div><dt>Difficulty</dt><dd>${esc(LEVELS[A.level || 0].name)}. Questions get harder as the test goes on.</dd></div>
               <div><dt>Calculator</dt><dd>${A.calc === "physical" ? "Physical calculator allowed, plus pen and paper" : "No calculator. Pen and paper only"}</dd></div>
             </dl>
             <ul class="rules-list">
               <li>Submit locks your answer; you cannot return.</li>
               <li>The timer continues if you leave or refresh.</li>
               <li>Skipped questions score as wrong. At 0:00 the test submits itself.</li>
-              <li>Keys 1–4 choose an option; Enter submits.</li>
+              <li>Number keys choose an option; Enter submits.</li>
             </ul>
             <button class="btn primary big" id="begin" data-autofocus>Begin test</button>
           </section>
@@ -632,6 +649,7 @@
           ${q.ex ? `<div class="qex">${exhibitHTML(q.ex)}</div>` : ""}
           <div class="qmain">
             <p class="stem" id="stem">${esc(q.stem)}</p>
+            <p class="select-one">Select only one</p>
             <div class="opts" role="radiogroup" aria-labelledby="stem">${opts}</div>
           </div>
         </div>
@@ -698,7 +716,7 @@
           <button class="btn primary" data-drill="${w.cat}|${esc(w.sub)}">Practise 5 questions</button>
         </div>
       </section>` : `<section class="panel focus"><p class="eyebrow">One thing to work on</p><h2>No points lost</h2><p>Try a harder setting: no calculator, or 15 questions per test.</p></section>`;
-    const notes = [];
+    const notes = [LEVELS[A.level || 0].name + "."];
     if (A.extra) notes.push(`Taken with +${A.extra}% extra time.`);
     notes.push(A.calc === "physical" ? "Physical calculator allowed." : "No calculator.");
     if (A.hidden) notes.push(`You left the test window ${A.hidden} time${A.hidden === 1 ? "" : "s"}. That isn't penalised here, but the real test tracks it.`);
@@ -755,7 +773,7 @@
       <p class="stem">${esc(q.stem)}</p>
       <ul class="review-opts">${opts}</ul>
       <div class="explain"><p class="explain-h">Worked solution · ${esc(right.t)}</p><ol>${q.sol.map((s) => `<li>${esc(s)}</li>`).join("")}</ol></div>
-      <p class="src small muted">${esc(q.src)} · ${esc(q.sub)} · L${q.tier}</p>`;
+      <p class="src small muted">${esc(q.src)} · ${esc(q.sub)} · ${TIER_NAMES[q.tier]}</p>`;
   }
 
   function reviewRow(q, ord, a, i) {
@@ -791,7 +809,7 @@
           <p class="fb-h">${ok ? "✓ Correct" : "✗ Not quite"}</p>
           ${!ok && mine && mine.w ? `<p><strong>Why your choice does not work:</strong> ${esc(mine.w)}</p>` : ""}
           <ol>${q.sol.map((s) => `<li>${esc(s)}</li>`).join("")}</ol>
-          <p class="small muted">${esc(q.src)} · ${esc(q.sub)} · L${q.tier}</p>
+          <p class="small muted">${esc(q.src)} · ${esc(q.sub)} · ${TIER_NAMES[q.tier]}</p>
         </div>`;
     }
     const lastQ = A.idx === A.qs.length - 1;
@@ -806,6 +824,7 @@
           ${q.ex ? `<div class="qex">${exhibitHTML(q.ex)}</div>` : ""}
           <div class="qmain">
             <p class="stem" id="stem">${esc(q.stem)}</p>
+            <p class="select-one">Select only one</p>
             <div class="opts" role="radiogroup" aria-labelledby="stem">${opts}</div>
             ${feedback}
           </div>
@@ -996,7 +1015,7 @@
     if (t.id === "drawer-open") { openDrawer(); return; }
     if (t.id === "drawer-close") { closeDrawer(); return; }
     if (t.id === "end-practice") { A.phase = "practiceDone"; saveA(); render(); return; }
-    if (t.id === "p-check") { A.ans[A.idx].checked = true; saveA(); render(); return; }
+    if (t.id === "p-check") { A.ans[A.idx].checked = true; if (isRight(A.qs[A.idx], A.ans[A.idx].sel)) markSolved(A.qs[A.idx].id); saveA(); render(); return; }
     if (t.id === "p-next") { if (A.idx < A.qs.length - 1) A.idx++; else A.phase = "practiceDone"; saveA(); render(); return; }
     if (t.id === "p-back") { if (A.idx > 0) A.idx--; saveA(); render(); return; }
     if (t.dataset.hpanel !== undefined) { historyPanel = t.dataset.hpanel || null; render(); return; }
@@ -1030,7 +1049,7 @@
       r[t.dataset.k] = t.type === "checkbox" ? t.checked : t.value;
       saveSettings(); return;
     }
-    if (["single", "qcount", "calc", "extra", "practiceSub"].includes(t.id)) { settings[t.id] = t.value; saveSettings(); if (t.id === "calc") render(); return; }
+    if (["single", "qcount", "calc", "extra", "practiceSub", "progression"].includes(t.id)) { settings[t.id] = t.value; saveSettings(); if (t.id === "calc") render(); return; }
     if (t.id === "practiceCat") { settings.practiceCat = t.value; settings.practiceSub = "all"; saveSettings(); render(); return; }
     if (t.id === "f-select" || t.id === "f-select-d") {
       formulasSection = t.value; formulasQuery = "";
@@ -1080,6 +1099,8 @@
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     if (/^[1-4]$/.test(e.key) && ["question", "practice", "intro"].includes(A.phase)) {
       e.preventDefault();
+      const radios = $$(`input[name="${A.phase === "intro" ? "exopt" : "opt"}"]`);
+      if (Number(e.key) > radios.length) return;
       selectOpt(Number(e.key) - 1);
       const r = $$(`input[name="${A.phase === "intro" ? "exopt" : "opt"}"]`)[Number(e.key) - 1];
       if (r && !r.disabled) r.focus();

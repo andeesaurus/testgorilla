@@ -13,11 +13,19 @@ Open `index.html` in a browser. It's fully client-side, with no build step or ba
 - **Formulas & Tips tab**: searchable cards with "Practice this" drills. It's locked during timed tests.
 - **History tab**: per-device history with accuracy and pace charts, plus export, import and reset.
 
-## Question bank (`js/questions.js`)
-- 25 reference sample items (CaseStar, CaseBasix, MBB Gorilla), each labelled with its source in the review.
-  The flawed CaseBasix sequence item (81, 54, 36, 24) is left out.
-- 91 original items across all six categories, plus generators that write new Numerical Reasoning,
-  Working with Data and number-series questions with fresh numbers on every draw.
-- Every wrong option carries the named mistake behind it.
+## Question bank (`js/questions.js`, `js/bank-*.js`)
+- 163 fixed questions across six categories, in four tiers: L1 warm-up, L2 core, L3 stretch, L4 challenge.
+- Every earlier question was rewritten with new numbers, contexts and wording, keeping its trap.
+  Reference samples (CaseStar, CaseBasix, MBB Gorilla) and the example screenshots appear only in adapted form.
+- New formats from the screenshots: person-hours work-rate problems, hidden rules in multi-year tables,
+  two-option "what insight would help most" judgment questions, and stress/workload people scenarios.
+- Generators write fresh-number questions on every draw (Numerical Reasoning, Working with Data, Problem Solving),
+  including L3/L4 work-rate, missing-segment weighted averages, reversed successive changes and table-rule items.
+
+## Difficulty
+- Within each test, questions run from easiest to hardest.
+- Progressive difficulty (default): each finished full mock moves the next one up a level, from the standard
+  3/6/3 mix to a mix weighted towards L3 and L4. A fixed level can be chosen in Setup.
+- Questions you have answered correctly are held back from later draws while fresh ones remain.
 
 Independent practice tool. Not affiliated with or endorsed by Bain & Company or TestGorilla.
